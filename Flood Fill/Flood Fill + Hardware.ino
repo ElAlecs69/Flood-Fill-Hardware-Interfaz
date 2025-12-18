@@ -63,7 +63,7 @@ const int SPEED_REVERSE = 70;  // Velocidad para reversa (un poco más lento)
 const int MOTOR_OFFSET = 5;
 
 // Constantes de distancia (en cm)
-const int FRONT_STOP = 7;
+const int FRONT_STOP = 7; // safer margin to avoid phantom wall marking
 const int MAX_SIDE_DISTANCE = 12;
 const int WALL_TOO_CLOSE = 4;
 const int WALL_TOO_FAR = 8;
@@ -74,6 +74,7 @@ const int BACK_WALL_DETECT = 7;  // Distancia para detectar pared atrás (si ret
 const int TURN_ANGLE = 38;
 const float CORRECTION_FACTOR = 3.0;
 const float WALL_CORRECTION_FACTOR = 8.0;
+const float ENC_CORRECTION_FACTOR = 1.2; // encoder differential correction
 const unsigned long TURN_TIMEOUT_MS = 900; // safety timeout for turns
 
 // Constantes de encoder y laberinto
@@ -96,8 +97,10 @@ volatile long encoderCountB = 0;
 // Prototipos de funciones
 void encoderISR_A();
 void encoderISR_B();
+long getEncoderError();
 void driveForwardWithCentering(int distLeft, int distRight, bool wallLeft, bool wallRight);
 void driveForwardStraight();
+void centerBeforeTurn();
 void driveBackwardOneCell();
 void resetStraightDrive();
 void turnRight90();
@@ -232,14 +235,17 @@ Serial.print(robotDir);
       driveOneCell();
       break;
     case MOVE_LEFT:
+      centerBeforeTurn();
       turnLeft90();
       driveOneCell();
       break;
     case MOVE_RIGHT:
+      centerBeforeTurn();
       turnRight90();
       driveOneCell();
       break;
     case MOVE_BACK:
+      centerBeforeTurn();
       turnLeft90();
       turnLeft90();
       driveOneCell();
@@ -249,16 +255,7 @@ Serial.print(robotDir);
       break;
   }
 
-  // After arriving to new cell center, read sensors and update map
-  distFront = getDistance(TRIG_FRONT, ECHO_FRONT);
-  distLeft = getDistance(TRIG_LEFT, ECHO_LEFT);
-  distRight = getDistance(TRIG_RIGHT, ECHO_RIGHT);
-  wallFront = (distFront <= FRONT_STOP) && (distFront > 0);
-  wallLeft = (distLeft < MAX_SIDE_DISTANCE) && (distLeft > 0);
-  wallRight = (distRight < MAX_SIDE_DISTANCE) && (distRight > 0);
-  updateWalls(wallFront, wallLeft, wallRight);
-  computeFloodFill();
-  
+  // we already updated walls at loop start; avoid double-updating per cell
   delay(50);
 }
 
@@ -326,10 +323,20 @@ long getEncoderAverage() {
   return avg;
 }
 
+long getEncoderError() {
+  noInterrupts();
+  long err = encoderCountA - encoderCountB;
+  interrupts();
+  return err;
+}
+
 // Avanzar con centrado entre paredes
 void driveForwardWithCentering(int distLeft, int distRight, bool wallLeft, bool wallRight) {
   updateGyro();
-  
+  // encoder differential correction
+  long encErr = getEncoderError();
+  int encCorrection = encErr * ENC_CORRECTION_FACTOR;
+
   // Corrección base por giroscopio
   int correccion = yaw * CORRECTION_FACTOR;
   
@@ -358,8 +365,9 @@ void driveForwardWithCentering(int distLeft, int distRight, bool wallLeft, bool 
   
   wallCorrection = constrain(wallCorrection, -20, 20);
   
-  int totalCorrection = correccion + wallCorrection;
-  
+  int totalCorrection = correccion + wallCorrection + encCorrection;
+  totalCorrection = constrain(totalCorrection, -30, 30);
+
   int velIzq = SPEED_NORMAL + totalCorrection;
   int velDer = (SPEED_NORMAL - MOTOR_OFFSET) - totalCorrection;
   
@@ -413,6 +421,10 @@ void turnRight90() {
   delay(200);
   // update logical heading
   robotDir = (robotDir + 1) % 4;
+  // reset encoders and gyro baseline after turn to avoid leftover errors
+  resetEncoders();
+  yaw = 0;
+  lastTime = micros();
 }
 
 void turnLeft90() {
@@ -433,6 +445,10 @@ void turnLeft90() {
   delay(200);
   // update logical heading
   robotDir = (robotDir + 3) % 4;
+  // reset encoders and gyro baseline after turn to avoid leftover errors
+  resetEncoders();
+  yaw = 0;
+  lastTime = micros();
 }
 
 void driveForward() {
@@ -486,7 +502,7 @@ bool canGo(int x, int y, int dir) {
   int nx = x + (dir==0?-1:(dir==2?1:0));
   int ny = y + (dir==1?1:(dir==3?-1:0));
   if (nx < 0 || nx >= MAZE_H || ny < 0 || ny >= MAZE_W) return false;
-  if (!visitedMap[nx][ny]) return false; // unknown cell treated as blocked for planner
+  // do NOT block movement into unknown cells here - flood-fill must be able to propagate
   return true;
 }
 
@@ -647,9 +663,16 @@ void driveOneCell() {
       computeFloodFill();
       return; // abort movement
     }
-    int correccion = yaw * CORRECTION_FACTOR;
-    int velIzq = SPEED_NORMAL + correccion;
-    int velDer = (SPEED_NORMAL - MOTOR_OFFSET) - correccion;
+    // encoder differential correction
+    long encErr = getEncoderError();
+    int encCorrection = encErr * ENC_CORRECTION_FACTOR;
+
+    int gyroCorrection = yaw * CORRECTION_FACTOR;
+    int totalCorrection = gyroCorrection + encCorrection;
+    totalCorrection = constrain(totalCorrection, -25, 25);
+
+    int velIzq = SPEED_NORMAL + totalCorrection;
+    int velDer = (SPEED_NORMAL - MOTOR_OFFSET) - totalCorrection;
     velIzq = constrain(velIzq, 50, 150);
     velDer = constrain(velDer, 50, 150);
     digitalWrite(IN1, HIGH);
@@ -671,4 +694,45 @@ void driveOneCell() {
   if (robotX >= 0 && robotX < MAZE_H && robotY >= 0 && robotY < MAZE_W)
     visitedMap[robotX][robotY] = true;
   // keep robotDir unchanged (turns change it where appropriate)
+}
+
+void centerBeforeTurn() {
+  int distLeft = getDistance(TRIG_LEFT, ECHO_LEFT);
+  int distRight = getDistance(TRIG_RIGHT, ECHO_RIGHT);
+
+  bool leftOK = (distLeft != 999 && distLeft > 0);
+  bool rightOK = (distRight != 999 && distRight > 0);
+
+  int correction = 0;
+  if (leftOK && rightOK) {
+    int diff = distLeft - distRight;
+    if (abs(diff) < 1) return;
+    correction = diff * WALL_CORRECTION_FACTOR / 2;
+  } else if (leftOK && !rightOK) {
+    int diff = distLeft - IDEAL_WALL_DISTANCE;
+    if (abs(diff) < 1) return;
+    correction = diff * WALL_CORRECTION_FACTOR;
+  } else if (rightOK && !leftOK) {
+    int diff = IDEAL_WALL_DISTANCE - distRight;
+    if (abs(diff) < 1) return;
+    correction = diff * WALL_CORRECTION_FACTOR;
+  } else {
+    return; // no useful data
+  }
+
+  int velIzq = SPEED_NORMAL + correction;
+  int velDer = SPEED_NORMAL - correction;
+
+  velIzq = constrain(velIzq, 60, 120);
+  velDer = constrain(velDer, 60, 120);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, velIzq);
+  analogWrite(ENB, velDer);
+
+  delay(60);
+  stopMotors();
 }
